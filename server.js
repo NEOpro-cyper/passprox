@@ -4,6 +4,9 @@
  *
  * Usage:   http://YOUR_VPS_IP:3000/https://target.com/path/stream.m3u8
  * Env:     PORT (default 3000) | HOST (default 0.0.0.0) | PROXY_TOKEN (optional)
+ *
+ * PROXY_TOKEN (optional shared secret): if set, clients must append ?_key=<token>
+ * to the proxied URL or send an "x-proxy-token" header. Off by default.
  */
 
 'use strict';
@@ -15,7 +18,9 @@ const PORT = parseInt(process.env.PORT, 10) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const PROXY_TOKEN = process.env.PROXY_TOKEN || '';
 
-/* Headers sent upstream — mirrors exactly what the Worker spoofed */
+/* ------------------------------------------------------------------ */
+/* Headers sent upstream — mirrors exactly what the Worker spoofed     */
+/* ------------------------------------------------------------------ */
 function buildUpstreamHeaders(req) {
   const h = {
     'Referer': 'https://play.xpass.top/',
@@ -30,13 +35,17 @@ function buildUpstreamHeaders(req) {
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"'
   };
+
+  // Small extras the Worker/CF runtime handled implicitly:
   if (req.headers.range) h['Range'] = req.headers.range;            // video seeking
   if (req.headers.cookie) h['Cookie'] = req.headers.cookie;         // cookies if player sent any
   if (req.headers['content-type']) h['Content-Type'] = req.headers['content-type']; // POST/PUT bodies
   return h;
 }
 
-/* CORS headers added to every response (same as the Worker) */
+/* ------------------------------------------------------------------ */
+/* CORS headers added to every response (same as the Worker)           */
+/* ------------------------------------------------------------------ */
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -44,18 +53,25 @@ const CORS = {
 };
 
 /* Hop-by-hop / recomputed headers we must NOT copy from upstream.
- * content-encoding: fetch() already decompressed the body. */
+ * content-encoding: fetch() already decompressed the body.            */
 const SKIPPED = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
   'proxy-authenticate', 'proxy-authorization', 'te', 'trailer',
   'content-encoding'
 ]);
 
+/* ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
   const abort = new AbortController();
   res.on('close', () => abort.abort()); // stop upstream when client leaves
 
   try {
+    /* ---- Health check for Docker/Coolify/K8s probes ---- */
+    if (req.url === '/health' || req.url === '/healthz') {
+      res.writeHead(200, { 'Content-Type': 'text/plain', ...CORS });
+      return res.end('ok');
+    }
+
     /* ---- CORS preflight (same as Worker's OPTIONS branch) ---- */
     if (req.method === 'OPTIONS') {
       res.writeHead(204, CORS);
@@ -67,31 +83,51 @@ const server = http.createServer(async (req, res) => {
     const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'http';
     const selfOrigin = `${proto}://${req.headers.host || `localhost:${PORT}`}`;
 
-    /* ---- Extract target URL from the path: /https://target.com/path?query ---- */
-    let rawPath = '';
-    let search = '';
-    try {
-      const parsed = new URL(req.url, 'http://internal.invalid');
-      rawPath = parsed.pathname.replace(/^\//, '');
-      search = parsed.search;
-    } catch { /* falls through to the 400 below */ }
+    /* ---- Extract target URL from the RAW request path ----
+     * Tolerates URL rewriting by proxies sitting in front of this app
+     * (nginx merge_slashes, some CDNs / Traefik normalizations):
+     *   /https://host/path          normal
+     *   /https:/host/path           // merged into / (nginx merge_slashes, default ON)
+     *   //https://host/path         extra leading slashes
+     *   /https%3A%2F%2Fhost/path    percent-encoded by an intermediary
+     */
+    let rawTarget = req.url || '/';
 
-    if (!/^https?:\/\//i.test(rawPath)) {
-      res.writeHead(400, { 'Content-Type': 'text/plain', ...CORS });
-      return res.end('Invalid proxy usage. Format: ' + selfOrigin + '/https://target.com/path');
+    // Absolute-form request line (some intermediaries send these)
+    rawTarget = rawTarget.replace(/^https?:\/\/[^/]+/i, '');
+
+    const qIdx = rawTarget.indexOf('?');
+    const rawPathPart = qIdx === -1 ? rawTarget : rawTarget.slice(0, qIdx);
+    const rawSearch = qIdx === -1 ? '' : rawTarget.slice(qIdx);
+    const candidate = rawPathPart.replace(/^\/+/, '');            // strip leading slashes
+    const fixScheme = (s) => s.replace(/^(https?:)\/+/i, '$1//'); // https:/x → https://x
+
+    let targetUrl = null;
+    const direct = fixScheme(candidate);
+    if (/^https?:\/\//i.test(direct)) {
+      try { targetUrl = new URL(direct + rawSearch); } catch { /* fall through */ }
+    }
+    if (!targetUrl) {
+      // Fallback: an intermediary may have percent-encoded the target URL
+      try {
+        let decoded = candidate;
+        for (let i = 0; i < 2 && !/^https?:\/\//i.test(decoded); i++) {
+          decoded = decodeURIComponent(decoded);
+        }
+        decoded = fixScheme(decoded);
+        if (/^https?:\/\//i.test(decoded)) targetUrl = new URL(decoded + rawSearch);
+      } catch { /* fall through */ }
     }
 
-    let targetUrl;
-    try {
-      targetUrl = new URL(rawPath + search);
-    } catch {
+    if (!targetUrl) {
       res.writeHead(400, { 'Content-Type': 'text/plain', ...CORS });
-      return res.end('Invalid target URL provided in path.');
+      return res.end('Invalid proxy usage. Format: ' + selfOrigin + '/https://target.com/path'
+        + '\nReceived path: ' + rawTarget.slice(0, 300));
     }
 
     /* ---- Optional shared-secret gate ---- */
     if (PROXY_TOKEN) {
-      const given = new URLSearchParams(search).get('_key') || req.headers['x-proxy-token'];
+      const given = new URLSearchParams(rawSearch).get('_key') || req.headers['x-proxy-token'];
       if (given !== PROXY_TOKEN) {
         res.writeHead(403, { 'Content-Type': 'text/plain', ...CORS });
         return res.end('Forbidden: missing or invalid token.');
