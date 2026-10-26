@@ -1,0 +1,9 @@
+{
+  "name": "hls-proxy",
+  "version": "1.0.0",
+  "description": "HLS/m3u8 CORS proxy with Referer/Origin spoofing (Cloudflare Worker port, zero dependencies)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
